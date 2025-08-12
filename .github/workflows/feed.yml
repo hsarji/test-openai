@@ -17,6 +17,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 3   # cancel the job if it runs longer than 3 minutes
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +25,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Optional: speed up installs between runs
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -45,7 +45,7 @@ jobs:
       - name: Generate RSS
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_LOG: debug               # show SDK/httpx debug lines in logs
+          OPENAI_LOG: debug
         run: |
           mkdir -p public
           python scripts/run_prompt.py \
@@ -67,6 +67,7 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 2   # optional, also limit deploy step
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
