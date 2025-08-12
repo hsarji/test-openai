@@ -1,1 +1,1 @@
-AI stories about practical uses, case studies, workflows, how-tos. Avoid funding/brand news.
+Create a summary of the news, top 20 stories with an emphasis on these topics: how people are using AI, especially in education, blogging, US politics, science news, the NBA and MLB, with a slight emphasis on the Knicks and Mets. 
