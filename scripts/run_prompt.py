@@ -3,36 +3,70 @@ import argparse
 import json
 import os
 import re
+import sys
+import time
 from pathlib import Path
-from feedgen.feed import FeedGenerator
 from datetime import datetime, timezone
-from openai import OpenAI
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+from feedgen.feed import FeedGenerator
+from openai import OpenAI
+import httpx
+
+# Configure the OpenAI client:
+# - 120s per request timeout (covers connect+read)
+# - max_retries=0 because we implement our own single manual retry
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),
+    timeout=120.0,
+    max_retries=0,
+)
 
 def _extract_json(text: str) -> list[dict]:
-    """Best-effort JSON extractor: try direct parse, then fenced code blocks."""
+    """Best-effort JSON extractor: direct parse, then fenced code block, then first array."""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    # Try to find a fenced JSON/code block
     m = re.search(r"```(?:json)?\s*($begin:math:display$.*?$end:math:display$)\s*```", text, re.DOTALL)
     if m:
         return json.loads(m.group(1))
-    # Try to find first [ ... ] block
     m = re.search(r"(\[.*\])", text, re.DOTALL)
     if m:
         return json.loads(m.group(1))
     raise json.JSONDecodeError("No valid JSON array found", text, 0)
 
+def _call_responses_with_retry(system_msg: str, user_prompt: str, retry_delay: float = 1.5):
+    """Call the Responses API once; on network error, retry exactly once after a brief delay."""
+    print("[openai] calling Responses API with web_search…", flush=True)
+    try:
+        return client.responses.create(
+            model="gpt-5",
+            tools=[{"type": "web_search"}],
+            input=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.HTTPError) as e:
+        print(f"[warn] OpenAI request failed ({type(e).__name__}: {e}); retrying once…", flush=True)
+        time.sleep(retry_delay)
+        # Second (and final) attempt
+        return client.responses.create(
+            model="gpt-5",
+            tools=[{"type": "web_search"}],
+            input=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
 def call_llm(prompt: str) -> list[dict]:
     """
     Return a list of items: [{title, url, summary, published}]
-    Uses the Responses API with the built-in web_search tool.
+    Uses the Responses API with built-in web_search.
     """
     system_msg = (
-        "You must use web search before answering. Find 20 recent news articles "
+        "You must use web search before answering. Find 12 recent news articles "
         "(last 30 days) emphasizing: how people are using AI, especially in "
         "education, blogging, US politics, science; and NBA/MLB with slight emphasis "
         "on the New York Knicks and New York Mets. De-duplicate domains and topics. "
@@ -41,47 +75,50 @@ def call_llm(prompt: str) -> list[dict]:
         'Use ISO 8601 UTC "YYYY-MM-DDTHH:MM:SSZ" for published.'
     )
 
-    print("[openai] calling Responses API with web_search…")
-    resp = client.responses.create(
-        model="gpt-5",                      # model that supports web_search
-        tools=[{"type": "web_search"}],     # browsing enabled
-        input=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt}
-        ],
-        # NOTE: no response_format and no temperature to maximize compatibility
-    )
-
-    # Helpful confirmation in CI logs
     try:
-        print(f"[openai] response_id={resp.id} model={resp.model} usage={resp.usage}")
+        resp = _call_responses_with_retry(system_msg, prompt)
+    except httpx.HTTPError as e:
+        print(f"[error] OpenAI request failed after retry: {type(e).__name__}: {e}", flush=True)
+        sys.exit(1)
+
+    try:
+        print(f"[openai] response_id={resp.id} model={resp.model} usage={resp.usage}", flush=True)
     except Exception:
         pass
 
-    text = resp.output_text
+    text = resp.output_text or ""
+    if not text.strip():
+        print("[error] Empty response from model.", flush=True)
+        sys.exit(1)
+
     try:
         items = _extract_json(text)
     except json.JSONDecodeError:
-        print("[error] Model did not return valid JSON. Raw output follows:")
+        print("[error] Model did not return valid JSON. Raw output follows:", flush=True)
         print(text)
-        raise
+        sys.exit(1)
 
     if not isinstance(items, list):
-        raise ValueError("Model did not return a JSON array.")
-    # Minimal field check
+        print("[error] Model did not return a JSON array.", flush=True)
+        sys.exit(1)
+
+    # Minimal schema checks
     for i, it in enumerate(items):
         if not isinstance(it, dict):
-            raise ValueError(f"Item {i} is not an object.")
+            print(f"[error] Item {i} is not an object.", flush=True)
+            sys.exit(1)
         for k in ("title", "url", "summary", "published"):
             if k not in it:
-                raise ValueError(f"Item {i} missing key: {k}")
+                print(f"[error] Item {i} missing key: {k}", flush=True)
+                sys.exit(1)
+
     return items
 
 def make_rss(items: list[dict], outfile: Path):
     fg = FeedGenerator()
     fg.load_extension('podcast')  # harmless/no-op if unused
     fg.title('Late News (AI practical uses)')
-    # Replace these with your real site + feed URLs when publishing:
+    # TODO: replace with your real site + feed URLs when publishing
     fg.link(href='https://example.com/', rel='alternate')
     fg.link(href='https://example.com/feed.xml', rel='self')
     fg.description('Auto-generated feed of practical AI stories.')
@@ -99,7 +136,7 @@ def make_rss(items: list[dict], outfile: Path):
 
     outfile.parent.mkdir(parents=True, exist_ok=True)
     fg.rss_file(str(outfile), pretty=True)
-    print(f"[rss] wrote {outfile} with {len(items)} items")
+    print(f"[rss] wrote {outfile} with {len(items)} items", flush=True)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -109,7 +146,8 @@ def main():
 
     prompt_path = Path(args.prompt_file)
     if not prompt_path.is_file():
-        raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
+        print(f"[error] Prompt file not found: {prompt_path}", flush=True)
+        sys.exit(1)
 
     prompt = prompt_path.read_text(encoding="utf-8")
     items = call_llm(prompt)
