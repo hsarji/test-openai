@@ -1,32 +1,43 @@
 # scripts/run_prompt.py
-import argparse, os, time
+import argparse, os, time, json
 from pathlib import Path
 from feedgen.feed import FeedGenerator
-
-# OpenAI SDK v1.x
 from openai import OpenAI
+
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 def call_llm(prompt: str) -> list[dict]:
     """
     Return a list of items: [{title, url, summary, published}]
-    Your prompt should ask for JSON. We use JSON mode to be strict.
+    We switch to the Responses API and enable the built-in web search tool.
     """
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",  # or your preferred model
-        messages=[
-            {"role": "system", "content": "Return JSON only: [{\"title\":\"...\",\"url\":\"...\",\"summary\":\"...\",\"published\":\"YYYY-MM-DDTHH:MM:SSZ\"}]"},
+    resp = client.responses.create(
+        model="gpt-5",  # model that supports tools in Responses API
+        tools=[{"type": "web_search"}],   # <-- this enables web browsing
+        temperature=0.2,
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    'You must use web search to find recent, real articles before answering. '
+                    'Return JSON only in this exact array shape: '
+                    '[{"title":"...","url":"...","summary":"...","published":"YYYY-MM-DDTHH:MM:SSZ"}]. '
+                    'No placeholders or example.com. Use canonical article URLs.'
+                )
+            },
             {"role": "user", "content": prompt}
         ],
-        temperature=0.2
+        # Optional: require valid JSON (object is recommended, but arrays work in practice)
+        # response_format={"type": "json_object"}
     )
-    import json
-    text = resp.choices[0].message.content
+
+    # output_text concatenates all text segments from the model/tool run
+    text = resp.output_text
     return json.loads(text)
 
 def make_rss(items: list[dict], outfile: Path):
     fg = FeedGenerator()
-    fg.load_extension('podcast')  # harmless/no-op if unused
+    fg.load_extension('podcast')
     fg.title('Late News (AI practical uses)')
     fg.link(href='https://example.com/', rel='alternate')
     fg.link(href='https://example.com/feed.xml', rel='self')
