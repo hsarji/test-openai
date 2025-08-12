@@ -2,14 +2,29 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from feedgen.feed import FeedGenerator
 from datetime import datetime, timezone
 from openai import OpenAI
 
-
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+def _extract_json(text: str) -> list[dict]:
+    """Best-effort JSON extractor: try direct parse, then fenced code blocks."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try to find a fenced JSON/code block
+    m = re.search(r"```(?:json)?\s*($begin:math:display$.*?$end:math:display$)\s*```", text, re.DOTALL)
+    if m:
+        return json.loads(m.group(1))
+    # Try to find first [ ... ] block
+    m = re.search(r"(\[.*\])", text, re.DOTALL)
+    if m:
+        return json.loads(m.group(1))
+    raise json.JSONDecodeError("No valid JSON array found", text, 0)
 
 def call_llm(prompt: str) -> list[dict]:
     """
@@ -21,45 +36,20 @@ def call_llm(prompt: str) -> list[dict]:
         "(last 30 days) emphasizing: how people are using AI, especially in "
         "education, blogging, US politics, science; and NBA/MLB with slight emphasis "
         "on the New York Knicks and New York Mets. De-duplicate domains and topics. "
-        "Return only JSON, no prose. Use canonical article URLs. "
-        'Each item must be: {"title","url","summary","published"} with '
-        'published as ISO 8601 UTC "YYYY-MM-DDTHH:MM:SSZ".'
+        "Return only JSON (no prose), as an array of objects with exactly these keys: "
+        'title, url, summary, published. Use canonical article URLs. '
+        'Use ISO 8601 UTC "YYYY-MM-DDTHH:MM:SSZ" for published.'
     )
 
-    schema = {
-        "type": "array",
-        "items": {
-            "type": "object",
-            "required": ["title", "url", "summary", "published"],
-            "properties": {
-                "title": {"type": "string"},
-                "url": {"type": "string", "format": "uri"},
-                "summary": {"type": "string"},
-                "published": {
-                    "type": "string",
-                    "pattern": r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
-                }
-            },
-            "additionalProperties": False
-        },
-        "minItems": 5,
-        "maxItems": 25
-    }
-
-    # Visible log lines in GitHub Actions
     print("[openai] calling Responses API with web_search…")
     resp = client.responses.create(
         model="gpt-5",                      # model that supports web_search
-        tools=[{"type": "web_search"}],     # <-- browsing enabled
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "NewsItems", "schema": schema, "strict": True}
-        },
+        tools=[{"type": "web_search"}],     # browsing enabled
         input=[
             {"role": "system", "content": system_msg},
             {"role": "user", "content": prompt}
         ],
-        # NOTE: do not pass temperature if the model doesn't support it
+        # NOTE: no response_format and no temperature to maximize compatibility
     )
 
     # Helpful confirmation in CI logs
@@ -68,21 +58,24 @@ def call_llm(prompt: str) -> list[dict]:
     except Exception:
         pass
 
-    # If you want to see full tool traces in CI, uncomment this:
-    # print(resp.model_dump_json(indent=2))
-
-    text = resp.output_text  # concatenates all text outputs from the run
+    text = resp.output_text
     try:
-        items = json.loads(text)
-    except json.JSONDecodeError as e:
+        items = _extract_json(text)
+    except json.JSONDecodeError:
         print("[error] Model did not return valid JSON. Raw output follows:")
         print(text)
         raise
 
     if not isinstance(items, list):
         raise ValueError("Model did not return a JSON array.")
+    # Minimal field check
+    for i, it in enumerate(items):
+        if not isinstance(it, dict):
+            raise ValueError(f"Item {i} is not an object.")
+        for k in ("title", "url", "summary", "published"):
+            if k not in it:
+                raise ValueError(f"Item {i} missing key: {k}")
     return items
-
 
 def make_rss(items: list[dict], outfile: Path):
     fg = FeedGenerator()
@@ -108,7 +101,6 @@ def make_rss(items: list[dict], outfile: Path):
     fg.rss_file(str(outfile), pretty=True)
     print(f"[rss] wrote {outfile} with {len(items)} items")
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt-file", required=True, help="Path to the prompt text/markdown file")
@@ -122,7 +114,6 @@ def main():
     prompt = prompt_path.read_text(encoding="utf-8")
     items = call_llm(prompt)
     make_rss(items, Path(args.out))
-
 
 if __name__ == "__main__":
     main()
